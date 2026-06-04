@@ -5,6 +5,8 @@ import torch.nn.functional as F
 from torch import nn
 import math
 
+from utils.calibration_metrics import append_calibration_sums
+
 IGNORE_LABEL_ID = -100
 
 
@@ -81,6 +83,12 @@ class ACTLossHead(nn.Module):
                 "q_halt_accuracy": (valid_metrics & ((outputs["q_halt_logits"] >= 0) == seq_is_correct)).sum(),
                 "steps":          torch.where(valid_metrics, new_carry.steps, 0).sum(),
             }
+            append_calibration_sums(
+                metrics,
+                valid=valid_metrics,
+                conf=torch.sigmoid(outputs["q_halt_logits"].float()),
+                correct=seq_is_correct,
+            )
 
         # Losses
 
@@ -100,4 +108,3 @@ class ACTLossHead(nn.Module):
         detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
 
         return new_carry, lm_loss + 0.5 * (q_halt_loss + q_continue_loss), metrics, detached_outputs, new_carry.halted.all()
-

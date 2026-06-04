@@ -21,6 +21,12 @@ from adam_atan2 import AdamATan2
 
 from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
 from utils.functions import load_model_class, get_model_source_path
+from models.losses import IGNORE_LABEL_ID
+from utils.calibration_metrics import (
+    compute_spearman_rho,
+    gather_vectors,
+    postprocess_eval_set_metrics,
+)
 from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 from models.ema import EMAHelper
 
@@ -504,6 +510,7 @@ def evaluate(
 
     with torch.inference_mode():
         return_keys = set(config.eval_save_outputs)
+        return_keys.update({"preds", "q_halt_logits"})
         for evaluator in evaluators:
             evaluator.begin_eval()
             return_keys.update(evaluator.required_outputs)
@@ -512,6 +519,8 @@ def evaluate(
         set_ids = {k: idx for idx, k in enumerate(eval_metadata.sets)}
 
         save_preds = {}
+        calib_conf: dict[str, list[torch.Tensor]] = {name: [] for name in set_ids}
+        calib_correct: dict[str, list[torch.Tensor]] = {name: [] for name in set_ids}
 
         metric_keys = []
         metric_values = None
@@ -553,6 +562,19 @@ def evaluate(
 
             for evaluator in evaluators:
                 evaluator.update_batch(batch, preds)
+
+            if "q_halt_logits" in preds and "preds" in preds:
+                mask = batch["labels"] != IGNORE_LABEL_ID
+                loss_counts = mask.sum(-1)
+                seq_is_correct = (mask & (preds["preds"] == batch["labels"])).sum(-1) == loss_counts
+                halted_valid = carry.halted & (loss_counts > 0)
+                if halted_valid.any():
+                    calib_conf[set_name].append(
+                        torch.sigmoid(preds["q_halt_logits"][halted_valid]).detach()
+                    )
+                    calib_correct[set_name].append(
+                        seq_is_correct[halted_valid].to(torch.float32).detach()
+                    )
 
             del carry, loss, preds, batch, all_finish
 
@@ -604,10 +626,33 @@ def evaluate(
                     for set_id, set_name in enumerate(set_ids)
                 }
 
-                # Postprocess
                 for set_name, m in reduced_metrics.items():
-                    count = m.pop("count")
-                    reduced_metrics[set_name] = {k: v / count for k, v in m.items()}
+                    reduced_metrics[set_name] = postprocess_eval_set_metrics(m)
+
+        for set_name in set_ids:
+            if not calib_conf[set_name]:
+                continue
+            conf_np = gather_vectors(
+                torch.cat(calib_conf[set_name]), rank=rank, world_size=world_size
+            )
+            correct_np = gather_vectors(
+                torch.cat(calib_correct[set_name]), rank=rank, world_size=world_size
+            )
+            if rank != 0 or conf_np.size == 0:
+                continue
+            rho = compute_spearman_rho(conf_np, correct_np)
+            if reduced_metrics is None:
+                reduced_metrics = {}
+            reduced_metrics.setdefault(set_name, {})["spearman_rho"] = rho
+
+        if rank == 0 and reduced_metrics is not None:
+            for set_name, m in reduced_metrics.items():
+                print(
+                    f"  {set_name}: exact_accuracy={m.get('exact_accuracy', 0):.4f} "
+                    f"brier={m.get('brier', 0):.4f} ece={m.get('ece', 0):.4f} "
+                    f"rho={m.get('spearman_rho', 0):.4f} "
+                    f"fair_crps={m.get('fair_crps', 0):.4f}"
+                )
 
         # Run evaluators
         if rank == 0:
@@ -655,6 +700,7 @@ def save_code_and_config(config: PretrainConfig):
     code_list = [
         get_model_source_path(config.arch.name),
         get_model_source_path(config.arch.loss.name),
+        os.path.join(os.path.dirname(__file__), "utils", "calibration_metrics.py"),
     ]
     for code_file in code_list:
         if code_file is not None:
